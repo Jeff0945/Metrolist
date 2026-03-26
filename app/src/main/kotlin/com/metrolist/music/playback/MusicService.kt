@@ -173,6 +173,8 @@ import com.metrolist.music.playback.queues.ListQueue
 import com.metrolist.music.playback.queues.Queue
 import com.metrolist.music.playback.queues.YouTubeQueue
 import com.metrolist.music.R
+import com.metrolist.music.constants.LoudnessLevel
+import com.metrolist.music.constants.LoudnessLevelKey
 import com.metrolist.music.utils.CoilBitmapLoader
 import com.metrolist.music.utils.dataStore
 import com.metrolist.music.utils.DiscordRPC
@@ -221,6 +223,8 @@ import timber.log.Timber
 
 private const val INSTANT_SILENCE_SKIP_STEP_MS = 15_000L
 private const val INSTANT_SILENCE_SKIP_SETTLE_MS = 350L
+
+private const val API_DEFAULT_TARGET_LUFS = -7.0
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @androidx.annotation.OptIn(UnstableApi::class)
@@ -782,9 +786,12 @@ class MusicService :
             dataStore.data
                 .map { it[AudioNormalizationKey] ?: true }
                 .distinctUntilChanged(),
-        ) { format, normalizeAudio ->
-            format to normalizeAudio
-        }.collectLatest(scope) { (format, normalizeAudio) -> setupLoudnessEnhancer() }
+            dataStore.data
+                .map { prefs -> prefs[LoudnessLevelKey].toEnum(LoudnessLevel.AGGRESSIVE) }
+                .distinctUntilChanged(),
+        ) { format, normalizeAudio, loudnessLevel ->
+            Triple(format, normalizeAudio, loudnessLevel)
+        }.collectLatest(scope) { (format, normalizeAudio, loudnessLevel) -> setupLoudnessEnhancer() }
 
         combine(
             dataStore.data.map { it[AudioOffload] ?: false },
@@ -1897,18 +1904,29 @@ class MusicService :
                         database.format(currentMediaId).first()
                     }
 
+                    val loudnessLevel = withContext(Dispatchers.IO) {
+                        dataStore.data
+                            .map { prefs -> prefs[LoudnessLevelKey].toEnum(LoudnessLevel.AGGRESSIVE) }
+                            .first()
+                    }
+
+                    val targetLufs = loudnessLevel.targetLufs
+
                     Timber.tag(TAG).d("Audio normalization enabled: $normalizeAudio")
                     Timber.tag(TAG)
                         .d("Format loudnessDb: ${format?.loudnessDb}, perceptualLoudnessDb: ${format?.perceptualLoudnessDb}")
 
                     // Use loudnessDb if available, otherwise fall back to perceptualLoudnessDb
-                    val loudness = format?.loudnessDb ?: format?.perceptualLoudnessDb
+                    val measuredLufs: Double? = format?.perceptualLoudnessDb ?: format?.loudnessDb?.let { it + API_DEFAULT_TARGET_LUFS }
 
                     withContext(Dispatchers.Main) {
-                        if (loudness != null) {
-                            val loudnessDb = loudness.toFloat()
-                            val targetGain = (-loudnessDb * 100).toInt()
+                        if (measuredLufs != null) {
+                            val loudnessDb = measuredLufs.let { it - targetLufs }
+                            val targetGain = (-loudnessDb * 100.0).toInt()
                             val clampedGain = targetGain.coerceIn(MIN_GAIN_MB, MAX_GAIN_MB)
+
+                            Timber.tag(TAG)
+                                .d("Normalization Target LUFS: $targetLufs, Measured LUFS: $measuredLufs, Calculated gain: $targetGain mB, Clamped gain: $clampedGain mB")
 
                             Timber.tag(TAG)
                                 .d("Calculated raw normalization gain: $targetGain mB (from loudness: $loudnessDb)")
